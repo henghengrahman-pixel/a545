@@ -46,7 +46,7 @@ function parseCookieHeader(cookieHeader, origin) {
   }).filter(Boolean);
 }
 
-async function createChecker({ baseUrl, playerListUrl = '', cookieHeader, timeoutMs = 15000, maxRetries = 2, browser: sharedBrowser = null }) {
+async function createChecker({ baseUrl, playerListUrl = '', cookieHeader, timeoutMs = 60000, maxRetries = 2, browser: sharedBrowser = null }) {
   const ownBrowser = !sharedBrowser;
   const browser = sharedBrowser || await launchBrowser();
   const context = await browser.newContext({ locale: 'id-ID', timezoneId: 'Asia/Jakarta' });
@@ -54,12 +54,54 @@ async function createChecker({ baseUrl, playerListUrl = '', cookieHeader, timeou
   if (cookies.length) await context.addCookies(cookies);
   const page = await context.newPage();
   page.setDefaultTimeout(timeoutMs);
+  page.setDefaultNavigationTimeout(timeoutMs);
+
+  async function agentFormReady(waitMs = 5000) {
+    const form = page.locator('form:has(input[name="usercheck"]):has(input[name="user"])').first();
+    try {
+      await form.waitFor({ state: 'attached', timeout: waitMs });
+      const checkbox = form.locator('input[name="usercheck"]').first();
+      const textInput = form.locator('input[name="user"][type="text"]:visible').first();
+      return (await checkbox.count()) > 0 && (await textInput.count()) > 0;
+    } catch { return false; }
+  }
 
   async function ensureAgentPage() {
-    await page.goto(playerListUrl || `${baseUrl}/agentplayerlist.php`, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    const checkbox = page.locator('form:has(input[name="usercheck"]) input[name="usercheck"]').first();
-    const textInput = page.locator('input[name="user"][type="text"]:visible').first();
-    if (await checkbox.count() === 0 || await textInput.count() === 0) throw new Error('SESSION_AGEN_TIDAK_VALID');
+    const targetUrl = playerListUrl || `${baseUrl}/agentplayerlist.php`;
+    const navigationAttempts = Math.max(2, Math.min(4, Number(maxRetries) + 1));
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= navigationAttempts; attempt++) {
+      try {
+        // commit confirms the server answered; the form below is the real readiness signal.
+        await page.goto(targetUrl, { waitUntil: 'commit', timeout: timeoutMs });
+        if (await agentFormReady(Math.min(timeoutMs, 30000))) return;
+      } catch (e) {
+        lastError = e;
+        // A slow document can exceed goto timeout while the useful form is already rendered.
+        if (await agentFormReady(3000)) return;
+      }
+
+      const currentUrl = page.url();
+      if (currentUrl && !/agentplayerlist\.php/i.test(currentUrl)) {
+        const body = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+        if (/login|sign\s*in|username|password|session|logout/i.test(`${currentUrl} ${body}`)) {
+          throw new Error('SESSION_AGEN_TIDAK_VALID');
+        }
+      }
+
+      if (attempt < navigationAttempts) {
+        await page.waitForTimeout(Math.min(1500 * attempt, 4000));
+      }
+    }
+
+    if (await agentFormReady(2000)) return;
+    const currentUrl = page.url();
+    const body = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    if (!/agentplayerlist\.php/i.test(currentUrl) || /login|sign\s*in|username|password|session expired/i.test(body)) {
+      throw new Error('SESSION_AGEN_TIDAK_VALID');
+    }
+    throw new Error(`AGENT_PAGE_TIDAK_SIAP: ${lastError?.message || 'form Nama Pemain tidak ditemukan'}`);
   }
 
   async function readHistoryPopup(popup) {
